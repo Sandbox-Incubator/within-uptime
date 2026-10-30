@@ -1,0 +1,56 @@
+name: uptime
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+permissions:
+  contents: write
+  issues: write
+concurrency: uptime
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      URL: https://app.withinline.com/up
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Check
+        id: check
+        run: |
+          for i in 1 2 3; do
+            code=$(curl -s -o /dev/null -w '%{http_code} %{time_total}s' --max-time 15 "$URL" || echo "000 timeout")
+            echo "try $i: $code"
+            case "$code" in 200*) echo "up=true" >> "$GITHUB_OUTPUT"; exit 0;; esac
+            sleep 20
+          done
+          echo "up=false" >> "$GITHUB_OUTPUT"; echo "last=$code" >> "$GITHUB_OUTPUT"
+      - name: Open an issue when down
+        if: steps.check.outputs.up == 'false'
+        run: |
+          open=$(gh issue list --label down --state open --json number -q '.[0].number')
+          if [ -z "$open" ]; then
+            gh label create down --color B60205 --force >/dev/null
+            gh issue create --label down --assignee merthurturk \
+              --title "app.withinline.com is down" \
+              --body "$URL failed 3 checks 20 s apart at $(date -u +%FT%TZ) (last: ${{ steps.check.outputs.last }}). Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          fi
+          exit 1
+      - name: Close the issue when back up
+        if: steps.check.outputs.up == 'true'
+        run: |
+          for n in $(gh issue list --label down --state open --json number -q '.[].number'); do
+            gh issue close "$n" --comment "Back up at $(date -u +%FT%TZ)."
+          done
+      - name: Keep the schedule alive
+        if: steps.check.outputs.up == 'true'
+        run: |
+          # GitHub turns off schedules after 60 days without a commit.
+          git fetch -q --depth=1 origin main
+          last=$(git log -1 --format=%ct FETCH_HEAD)
+          if [ $(( $(date +%s) - last )) -gt $(( 45 * 86400 )) ]; then
+            git checkout -q FETCH_HEAD
+            git -c user.name=uptime -c user.email=uptime@users.noreply.github.com commit -q --allow-empty -m "Keep the uptime schedule alive"
+            git push -q origin HEAD:main
+          fi
